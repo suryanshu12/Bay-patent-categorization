@@ -2,17 +2,17 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
-import re
-from dotenv import load_dotenv
+import time
 import os
+from dotenv import load_dotenv
 
 # -------------------- Config --------------------
+load_dotenv()
 DB_NAME = "patent.db"
 load_dotenv()
 OPENAI_API_KEY =os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 
 # -------------------- Database Functions --------------------
 def create_connection():
@@ -53,7 +53,6 @@ DEFAULT_INSTRUCTION_PROMPT = (
 )
 
 def build_final_prompt(user_prompt, patent):
-    """Automatically append patent data to user instructions."""
     return f"""
 {user_prompt}
 
@@ -65,32 +64,36 @@ Description: {patent.get('Description', '')}
 """
 
 def summarize_patent(patent: dict, instruction_prompt: str) -> str:
-    """Use GPT to summarize a single patent."""
     final_prompt = build_final_prompt(instruction_prompt, patent)
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are an expert patent analyst."},
-            {"role": "user", "content": final_prompt}
-        ]
-    )
+    for attempt in range(5):  # retry on rate limits
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are an expert patent analyst."},
+                    {"role": "user", "content": final_prompt}
+                ]
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if "rate_limit" in str(e).lower():
+                wait_time = 2 ** attempt
+                st.warning(f"⚠️ Rate limit hit. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise e
+    st.error("❌ Max retries exceeded.")
+    return ""
 
-    return response.choices[0].message.content.strip()
-
-def parse_summary(summary: str) -> dict:
-    data = {"Industry Domain": "", "Technology Area": "", "Sub-Technology Area": "", "Keywords": ""}
-    patterns = {
-        "Industry Domain": r"Industry Domain:\s*(.*)",
-        "Technology Area": r"Technology Area:\s*(.*)",
-        "Sub-Technology Area": r"Sub-Technology Area:\s*(.*)",
-        "Keywords": r"Keywords:\s*(.*)"
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, summary, re.IGNORECASE)
-        if match:
-            data[key] = match.group(1).strip()
-    return data
+def parse_dynamic_summary(summary: str) -> dict:
+    """Parse GPT output dynamically into key-value pairs."""
+    parsed = {}
+    for line in summary.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            parsed[key.strip()] = value.strip()
+    return parsed
 
 # -------------------- Streamlit UI --------------------
 def main():
@@ -112,43 +115,67 @@ def main():
             st.session_state["instruction_prompt"] = DEFAULT_INSTRUCTION_PROMPT
             st.rerun()
 
-        st.caption("✏️ This will always include Title, Abstract, Claims, and Description automatically.")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        search_patents = st.text_input("Enter Patent Numbers (comma separated)", "")
+    with col2:
+        uploaded_file = st.file_uploader("📂 Upload Excel with Patent Numbers", type=["xlsx", "xls"])
 
-    # Patent input box
-    search_patents = st.text_input("Enter Patent Numbers (comma separated)", "")
+    patent_numbers = []
 
     if search_patents:
-        numbers = [n.strip() for n in search_patents.split(",") if n.strip()]
-        results = get_patents_by_numbers(numbers)
+        patent_numbers += [n.strip() for n in search_patents.split(",") if n.strip()]
 
+    if uploaded_file:
+        try:
+            df_uploaded = pd.read_excel(uploaded_file)
+            col_candidates = [c for c in df_uploaded.columns if 'patent no' in c.lower()]
+            if col_candidates:
+                excel_numbers = df_uploaded[col_candidates[0]].dropna().astype(str).tolist()
+                patent_numbers += excel_numbers
+            else:
+                st.error("❌ Excel file must have a column named 'Patent No.'")
+        except Exception as e:
+            st.error(f"❌ Failed to read Excel file: {e}")
+
+    if patent_numbers:
+        results = get_patents_by_numbers(patent_numbers)
         if results:
+            all_fields = []  # store field names dynamically
             export_data = []
             for idx, patent in enumerate(results, start=1):
                 st.markdown(f"## 📑 Patent {idx}: {patent['Patent_Number']}")
                 with st.spinner(f"Summarizing {patent['Patent_Number']}..."):
                     summary = summarize_patent(patent, instruction_prompt)
-                    parsed = parse_summary(summary)
+                    parsed = parse_dynamic_summary(summary)
 
+                # show exactly what GPT returned
                 st.markdown("### 💡 AI Summary")
-                st.write(summary)
+                for k, v in parsed.items():
+                    st.write(f"**{k}:** {v}")
+                    if k not in all_fields:
+                        all_fields.append(k)
 
                 st.markdown("### 📜 Patent Details")
                 st.write(f"**Title:** {patent['Title']}")
                 st.write(f"**Abstract:** {patent['Abstract']}")
                 st.markdown("---")
 
-                export_data.append({
+                row_data = {
                     "Patent Number": patent['Patent_Number'],
                     "Title": patent['Title'],
-                    "Abstract": patent['Abstract'],
-                    "Industry Domain": parsed["Industry Domain"],
-                    "Technology Area": parsed["Technology Area"],
-                    "Sub-Technology Area": parsed["Sub-Technology Area"],
-                    "Keywords": parsed["Keywords"]
-                })
+                    "Abstract": patent['Abstract']
+                }
+                row_data.update(parsed)
+                export_data.append(row_data)
 
             if export_data:
+                # Build DataFrame with Title & Abstract always first
+                ordered_columns = ["Patent Number", "Title", "Abstract"] + all_fields
                 df_export = pd.DataFrame(export_data)
+                # Reorder columns safely (if some columns missing)
+                df_export = df_export[[col for col in ordered_columns if col in df_export.columns]]
+
                 excel_file = "patent_categorization.xlsx"
                 df_export.to_excel(excel_file, index=False)
 
@@ -164,4 +191,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
